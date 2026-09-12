@@ -1,0 +1,9 @@
+Apply the patch on top of this upstream commit:
+
+  upstream   : https://github.com/QL-Win/QuickLook.git
+  base commit: a3ab1930c7c1865666c0df9d848b305b082ba04f
+  patched    : bbd470c (branch office-preview-patched)
+
+  git clone https://github.com/QL-Win/QuickLook.git
+  cd QuickLook && git checkout a3ab1930c7c1865666c0df9d848b305b082ba04f
+  git apply /path/to/0001-office-preview-optimization-protected-view.patch

@@ -1,0 +1,1785 @@
+From cf34743ea00cdcb7aeadd42074c5383c3a4480a8 Mon Sep 17 00:00:00 2001
+From: Fei Yunbin <realshadow4869@gmail.com>
+Date: Sat, 12 Sep 2026 14:03:22 +0800
+Subject: [PATCH 1/2] OfficeViewer: preview performance optimization +
+ Protected View copy-preview
+
+Performance (O1-O4):
+- New OfficePreviewHostPool.cs: keeps the Office IClassFactory alive for ~2ms warm
+  activation, and adds an idle watchdog that calls LockServer(false) + releases the
+  factory on the UI thread so the Office processes actually exit (fixes the 355MB
+  permanently-resident WINWORD/EXCEL/POWERPNT leak).
+- Drop the blocking GC.Collect() from PreviewHandlerHost.Dispose() - it ran on the WPF
+  UI thread on every preview close.
+- Remember which IInitialize* flavour actually succeeded per CLSID instead of probing
+  IInitializeWithStream -> WithItem -> WithFile on every preview (Office handlers only
+  implement IInitializeWithFile).
+- Two-stage background warm-up (WarmUpAfterFirstPreview default on, WarmUpAtStartup
+  default off) so the 480-860ms cold activation moves off the user-visible path.
+- Log per-preview timing.
+
+Protected View:
+- Never touch the user's original file. When the document carries a Zone.Identifier,
+  the plugin now renders an unblocked *copy* in %TEMP% and shows an amber banner
+  saying so.
+- The banner carries a button that unblocks the original file only when the user
+  clicks it, after which the strip turns green.
+- The blocking Yes/No confirmation dialog is removed entirely.
+
+Build note: WindowInteropHelperExtension.cs is rewritten from the C#14 extension-block
+syntax into an equivalent classic extension method so it compiles on .NET SDK 9.
+---
+ .../WindowInteropHelperExtension.cs           |  24 +-
+ .../OfficePreviewHostPool.cs                  | 456 ++++++++++++++++++
+ .../QuickLook.Plugin.OfficeViewer/Plugin.cs   | 150 ++++--
+ .../PreviewHandlerHost.cs                     | 230 +++++----
+ .../PreviewPanel.cs                           |   4 +-
+ .../ProtectedViewBanner.cs                    | 182 +++++++
+ .../ProtectedViewPreview.cs                   | 253 ++++++++++
+ 7 files changed, 1128 insertions(+), 171 deletions(-)
+ create mode 100644 QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/OfficePreviewHostPool.cs
+ create mode 100644 QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
+ create mode 100644 QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewPreview.cs
+
+diff --git a/QuickLook.Common/ExtensionMethods/WindowInteropHelperExtension.cs b/QuickLook.Common/ExtensionMethods/WindowInteropHelperExtension.cs
+index 7a93722..57ce32f 100644
+--- a/QuickLook.Common/ExtensionMethods/WindowInteropHelperExtension.cs
++++ b/QuickLook.Common/ExtensionMethods/WindowInteropHelperExtension.cs
+@@ -23,20 +23,20 @@ namespace QuickLook.Common.ExtensionMethods;
+ 
+ public static class WindowInteropHelperExtension
+ {
+-    extension(WindowInteropHelper windowInteropHelper)
++    // NOTE: upstream declares this with the C# 14 `extension(WindowInteropHelper ...) { ... }`
++    // block syntax, which requires a .NET 10 toolchain. It is written here as a classic
++    // extension method so the tree also builds on the .NET 9 SDK. Behaviour is identical.
++    public static nint EnsureHandleSafe(this WindowInteropHelper windowInteropHelper)
+     {
+-        public nint EnsureHandleSafe()
++        try
+         {
+-            try
+-            {
+-                return windowInteropHelper?.EnsureHandle() ?? IntPtr.Zero;
+-            }
+-            catch (Exception e)
+-            {
+-                // Returning 0 is fine, since this error usually only occurs when the window is already closed or being disposed.
+-                ProcessHelper.WriteLog(e.ToString());
+-                return IntPtr.Zero;
+-            }
++            return windowInteropHelper?.EnsureHandle() ?? IntPtr.Zero;
++        }
++        catch (Exception e)
++        {
++            // Returning 0 is fine, since this error usually only occurs when the window is already closed or being disposed.
++            ProcessHelper.WriteLog(e.ToString());
++            return IntPtr.Zero;
+         }
+     }
+ }
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/OfficePreviewHostPool.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/OfficePreviewHostPool.cs
+new file mode 100644
+index 0000000..dd1c41f
+--- /dev/null
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/OfficePreviewHostPool.cs
+@@ -0,0 +1,456 @@
++// Copyright © 2017-2026 QL-Win Contributors
++//
++// This file is part of QuickLook program.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++using QuickLook.Common.Helpers;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Runtime.InteropServices;
++using System.Threading;
++using System.Windows;
++using System.Windows.Threading;
++
++namespace QuickLook.Plugin.OfficeViewer;
++
++/// <summary>
++/// Which <c>IInitializeWith*</c> flavour a preview handler actually implemented.
++/// The Office handlers only implement <see cref="File"/>; probing Stream/Item every
++/// single preview is wasted work (it opens the file and creates a Shell item for nothing).
++/// </summary>
++internal enum InitKind
++{
++    Unknown = 0,
++    File,
++    Item,
++    Stream,
++    None,
++}
++
++/// <summary>
++/// Owns the lifetime of the out-of-process COM class factories which host the Office
++/// preview handlers (EXCEL.EXE / WINWORD.EXE / POWERPNT.EXE).
++///
++/// <para><b>Why this exists.</b> Measured on a stock Windows + Office install, the three
++/// Office preview handlers are registered with a <c>LocalServer32</c> that points straight
++/// at the Office executables and implement <b>only</b> <c>IInitializeWithFile</c>
++/// (<c>CLSCTX_INPROC_SERVER</c> returns <c>0x80040154</c>). A cold activation therefore
++/// costs 480-863 ms because it literally starts Excel/Word/PowerPoint, while a warm
++/// activation costs ~2 ms — a 200-400x difference. Caching the <c>IClassFactory</c> is
++/// what buys the fast path.</para>
++///
++/// <para><b>The leak this fixes.</b> The original code called <c>LockServer(true)</c> and
++/// never paired it with <c>LockServer(false)</c> anywhere in the repository, so the three
++/// Office processes stayed resident forever (~355 MB working set) and kept pushing the
++/// file cache out from under the rest of the system. This pool adds the missing half: an
++/// idle watchdog unlocks and releases the factories once no preview has run for
++/// <see cref="IdleTimeoutSeconds"/> seconds, letting Office shut itself down.</para>
++///
++/// <para><b>Threading.</b> A COM class factory obtained from <c>CoGetClassObject</c> is
++/// bound to the apartment of the thread that obtained it, and QuickLook always drives the
++/// preview from its WPF UI thread (STA). Every method here therefore has to run on that
++/// same UI thread — including warm-up, which is why warm-up is queued onto the
++/// <see cref="Dispatcher"/> at <see cref="DispatcherPriority.Background"/> rather than
++/// farmed out to a thread-pool thread. Doing it on a background thread would hand back an
++/// interface pointer that is illegal to use from the UI apartment.</para>
++/// </summary>
++internal static class OfficePreviewHostPool
++{
++    private const uint ClsctxLocalServer = 0x4;
++
++    private static readonly Guid IidIClassFactory = new("00000001-0000-0000-C000-000000000046");
++
++    private static readonly Guid IidIUnknown = new("00000000-0000-0000-C000-000000000046");
++
++    /// <summary>Default idle timeout before Office hosts are released, in seconds.</summary>
++    internal const int DefaultIdleTimeoutSeconds = 300;
++
++    /// <summary>How often the idle watchdog runs, in milliseconds.</summary>
++    private const int WatchdogIntervalMs = 30_000;
++
++    /// <summary>Delay between two warm-up activations, in milliseconds.</summary>
++    private const int WarmUpSpacingMs = 1200;
++
++    private static readonly object Gate = new();
++
++    private static readonly Dictionary<Guid, Entry> Entries = [];
++
++    private static readonly Dictionary<Guid, InitKind> InitPreferences = [];
++
++    private static readonly HashSet<Guid> WarmUpQueue = [];
++
++    private static Timer _watchdog;
++
++    private static bool _watchdogStarted;
++
++    private static int _idleTimeoutSeconds = DefaultIdleTimeoutSeconds;
++
++    [DllImport("ole32.dll", ExactSpelling = true, PreserveSig = true)]
++    private static extern int CoGetClassObject(
++        ref Guid rclsid,
++        uint dwClsContext,
++        IntPtr pvReserved,
++        ref Guid riid,
++        [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
++
++    private sealed class Entry
++    {
++        public Guid Clsid;
++
++        /// <summary>The RCW we hold for the class factory (keeps the server alive).</summary>
++        public object Rcw;
++
++        public IClassFactory Factory;
++
++        /// <summary>True when the CLSID has no LocalServer registration at all.</summary>
++        public bool LocalServerUnavailable;
++
++        public DateTime LastUsedUtc;
++    }
++
++    /// <summary>
++    /// Applies the user's idle-reclaim configuration. Called once from the plugin.
++    /// A value of 0 disables reclamation (Office stays resident, as before).
++    /// </summary>
++    internal static void Configure(int idleTimeoutSeconds)
++    {
++        lock (Gate)
++        {
++            _idleTimeoutSeconds = idleTimeoutSeconds;
++            EnsureWatchdogLocked();
++        }
++    }
++
++    /// <summary>
++    /// Returns a cached class factory for <paramref name="clsid"/>, creating (and thereby
++    /// cold-starting) the server if this is the first use. Returns null when the CLSID has
++    /// no out-of-process registration, in which case the caller may try in-process.
++    /// Must be called on the UI thread.
++    /// </summary>
++    internal static IClassFactory TryGetFactory(Guid clsid, out bool localServerUnavailable)
++    {
++        lock (Gate)
++        {
++            EnsureWatchdogLocked();
++
++            if (Entries.TryGetValue(clsid, out var cached))
++            {
++                cached.LastUsedUtc = DateTime.UtcNow;
++                localServerUnavailable = cached.LocalServerUnavailable;
++                return cached.Factory;
++            }
++
++            var entry = new Entry { Clsid = clsid, LastUsedUtc = DateTime.UtcNow };
++
++            var factoryIid = IidIClassFactory;
++            var hr = CoGetClassObject(ref clsid, ClsctxLocalServer, IntPtr.Zero, ref factoryIid, out var rcw);
++            if (hr < 0 || rcw == null)
++            {
++                entry.LocalServerUnavailable = true;
++                Entries[clsid] = entry;
++                localServerUnavailable = true;
++                return null;
++            }
++
++            entry.Rcw = rcw;
++            entry.Factory = (IClassFactory)rcw;
++
++            // Lock the server so it survives between previews. This is paired by
++            // ReleaseEntry() — the pairing the original code was missing.
++            try
++            {
++                entry.Factory.LockServer(true);
++            }
++            catch (COMException e)
++            {
++                ProcessHelper.WriteLog($"OfficePreviewHostPool: LockServer failed for {clsid:B}: {e.Message}");
++            }
++
++            Entries[clsid] = entry;
++            localServerUnavailable = false;
++            return entry.Factory;
++        }
++    }
++
++    /// <summary>
++    /// Creates a handler instance from the cached factory, evicting a dead host and retrying
++    /// once. Sets <paramref name="localServerUnavailable"/> when the CLSID turned out to have
++    /// no out-of-process registration at all. Must be called on the UI thread.
++    /// </summary>
++    internal static object CreateHandlerInstance(Guid clsid, out bool localServerUnavailable)
++    {
++        var factory = TryGetFactory(clsid, out localServerUnavailable);
++        if (factory == null)
++            return null;
++
++        for (var attempt = 0; attempt < 2; attempt++)
++        {
++            try
++            {
++                var iid = IidIUnknown;
++                factory.CreateInstance(null, ref iid, out var instance);
++                return instance;
++            }
++            catch (COMException)
++            {
++                // The host process probably died between previews. Drop the stale entry so
++                // the next attempt cold-starts a fresh one.
++                Evict(clsid);
++                factory = TryGetFactory(clsid, out localServerUnavailable);
++                if (factory == null)
++                    return null;
++            }
++        }
++
++        return null;
++    }
++
++    /// <summary>
++    /// Evicts a single CLSID, releasing the factory reference so a dead server can be
++    /// replaced.
++    /// </summary>
++    private static void Evict(Guid clsid)
++    {
++        Entry stale = null;
++
++        lock (Gate)
++        {
++            if (!Entries.TryGetValue(clsid, out var entry))
++                return;
++
++            stale = new Entry { Clsid = clsid, Rcw = entry.Rcw, Factory = entry.Factory };
++            Entries.Remove(clsid);
++        }
++
++        Release(stale);
++    }
++
++    /// <summary>
++    /// The init-interface a handler for <paramref name="clsid"/> turned out to support, so
++    /// later previews can skip the flavours that are known to fail.
++    /// </summary>
++    internal static InitKind GetInitPreference(Guid clsid)
++    {
++        lock (Gate)
++        {
++            return InitPreferences.TryGetValue(clsid, out var kind) ? kind : InitKind.Unknown;
++        }
++    }
++
++    internal static void SetInitPreference(Guid clsid, InitKind kind)
++    {
++        lock (Gate)
++        {
++            InitPreferences[clsid] = kind;
++        }
++    }
++
++    /// <summary>
++    /// Schedules a background-priority warm-up of the given Office handler CLSIDs.
++    ///
++    /// The heavy part of a cold preview is <c>CoGetClassObject</c> starting the Office
++    /// executable. Doing that at <see cref="DispatcherPriority.Background"/> keeps it out
++    /// of the user-visible path: the dispatcher only gets here once the window has been
++    /// shown and nothing else is queued, so by the time the user picks the next file the
++    /// server is already up and activation collapses to ~2 ms.
++    ///
++    /// Requests are coalesced and already-warm CLSIDs are skipped, so calling this
++    /// liberally is cheap.
++    /// </summary>
++    internal static void RequestWarmUp(IEnumerable<Guid> clsids)
++    {
++        var dispatcher = Application.Current?.Dispatcher;
++        if (dispatcher == null || dispatcher.HasShutdownStarted)
++            return;
++
++        var added = false;
++        lock (Gate)
++        {
++            foreach (var clsid in clsids)
++            {
++                if (clsid == Guid.Empty)
++                    continue;
++
++                // Already warm, or already queued.
++                if (Entries.TryGetValue(clsid, out var entry) && entry.Factory != null)
++                    continue;
++
++                if (WarmUpQueue.Add(clsid))
++                    added = true;
++            }
++        }
++
++        if (!added)
++            return;
++
++        dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(RunWarmUp));
++    }
++
++    private static void RunWarmUp()
++    {
++        Guid next;
++        lock (Gate)
++        {
++            if (WarmUpQueue.Count == 0)
++                return;
++
++            using var it = WarmUpQueue.GetEnumerator();
++            it.MoveNext();
++            next = it.Current;
++            WarmUpQueue.Remove(next);
++        }
++
++        try
++        {
++            TryGetFactory(next, out _);
++        }
++        catch (Exception e)
++        {
++            ProcessHelper.WriteLog($"OfficePreviewHostPool: warm-up of {next:B} failed: {e.Message}");
++        }
++
++        // Yield the UI thread between activations so a warm-up never turns into one long
++        // freeze, then come back at Background priority for the next one.
++        var dispatcher = Application.Current?.Dispatcher;
++        if (dispatcher != null && !dispatcher.HasShutdownStarted && IsWarmUpPending())
++        {
++            var timer = new DispatcherTimer(DispatcherPriority.Background, dispatcher)
++            {
++                Interval = TimeSpan.FromMilliseconds(WarmUpSpacingMs),
++            };
++            timer.Tick += (s, _) =>
++            {
++                ((DispatcherTimer)s).Stop();
++                RunWarmUp();
++            };
++            timer.Start();
++        }
++    }
++
++    private static bool IsWarmUpPending()
++    {
++        lock (Gate)
++        {
++            return WarmUpQueue.Count > 0;
++        }
++    }
++
++    private static void EnsureWatchdogLocked()
++    {
++        if (_watchdogStarted)
++            return;
++
++        _watchdogStarted = true;
++        _watchdog = new Timer(OnWatchdogTick, null, WatchdogIntervalMs, WatchdogIntervalMs);
++    }
++
++    /// <summary>
++    /// Watchdog entry point. Runs on a thread-pool thread, so it does no COM work itself —
++    /// it just hops onto the UI thread, which is the apartment that owns the factories.
++    /// </summary>
++    private static void OnWatchdogTick(object state)
++    {
++        var dispatcher = Application.Current?.Dispatcher;
++        if (dispatcher == null || dispatcher.HasShutdownStarted)
++            return;
++
++        dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ReclaimIdleEntries));
++    }
++
++    /// <summary>
++    /// Unlocks and releases every factory that has been idle for longer than the configured
++    /// timeout. Must run on the UI thread (see the threading note on the class).
++    /// </summary>
++    private static void ReclaimIdleEntries()
++    {
++        var timeout = _idleTimeoutSeconds;
++        if (timeout <= 0)
++            return;
++
++        List<Entry> stale = null;
++        var now = DateTime.UtcNow;
++
++        lock (Gate)
++        {
++            foreach (var kv in Entries)
++            {
++                var entry = kv.Value;
++                if (entry.Factory == null || (now - entry.LastUsedUtc).TotalSeconds < timeout)
++                    continue;
++
++                // Take ownership of the references and clear them from the entry in the
++                // same locked step, so nothing can hand them out again. The references
++                // themselves have to be captured here — releasing them must happen outside
++                // the lock, and by then the live entry no longer points at them.
++                (stale ??= []).Add(new Entry
++                {
++                    Clsid = entry.Clsid,
++                    Rcw = entry.Rcw,
++                    Factory = entry.Factory,
++                });
++                entry.Rcw = null;
++                entry.Factory = null;
++            }
++        }
++
++        if (stale == null)
++            return;
++
++        foreach (var entry in stale)
++            Release(entry);
++
++        ProcessHelper.WriteLog(
++            $"OfficePreviewHostPool: released {stale.Count} idle Office preview host(s) after {timeout}s " +
++            $"idle: {string.Join(", ", stale.Select(s => s.Clsid.ToString("B")))}");
++    }
++
++    /// <summary>
++    /// Unlocks the server and drops our class-factory reference. This is the pair for
++    /// <c>LockServer(true)</c>; with it the Office process is free to shut down.
++    /// </summary>
++    private static void Release(Entry entry)
++    {
++        if (entry == null)
++            return;
++
++        if (entry.Factory != null)
++        {
++            try
++            {
++                entry.Factory.LockServer(false);
++            }
++            catch (Exception e)
++            {
++                ProcessHelper.WriteLog($"OfficePreviewHostPool: LockServer(false) failed: {e.Message}");
++            }
++        }
++
++        if (entry.Rcw != null)
++        {
++            try
++            {
++                Marshal.FinalReleaseComObject(entry.Rcw);
++            }
++            catch (Exception)
++            {
++                // ignored
++            }
++        }
++
++        entry.Rcw = null;
++        entry.Factory = null;
++    }
++}
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
+index cc53a1f..ca341f9 100644
+--- a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
+@@ -18,6 +18,8 @@
+ using QuickLook.Common.Helpers;
+ using QuickLook.Common.Plugin;
+ using System;
++using System.Collections.Generic;
++using System.Diagnostics;
+ using System.IO;
+ using System.Linq;
+ using System.Windows;
+@@ -28,6 +30,8 @@ namespace QuickLook.Plugin.OfficeViewer;
+ 
+ public sealed class Plugin : IViewer
+ {
++    private const string SettingDomain = "QuickLook.Plugin.OfficeViewer";
++
+     private static readonly string[] Extensions =
+     [
+         ".doc", ".docx", ".docm", ".odt",
+@@ -36,12 +40,48 @@ public sealed class Plugin : IViewer
+         ".vsd", ".vsdx",
+     ];
+ 
++    /// <summary>
++    /// Representative extensions used to discover which preview handlers exist on this
++    /// machine, so the warm-up can pre-activate exactly those and skip the rest.
++    /// </summary>
++    private static readonly string[] WarmUpExtensions = [".xlsx", ".docx", ".pptx", ".vsdx"];
++
+     private PreviewPanel _panel;
+ 
++    /// <summary>
++    /// Path of the temporary, unblocked copy backing the current preview, or <c>null</c> when
++    /// the document was previewed in place. Kept only so it can be cleaned up.
++    /// </summary>
++    private string _temporaryCopy;
++
+     public int Priority => -1;
+ 
+     public void Init()
+     {
++        // Applies the idle-reclaim policy and (optionally) pre-activates the Office preview
++        // hosts. Init runs once, on the UI thread, while the plugin manager is loading.
++        OfficePreviewHostPool.Configure(
++            SettingHelper.Get("HandlerIdleTimeoutSeconds",
++                OfficePreviewHostPool.DefaultIdleTimeoutSeconds, SettingDomain));
++
++        if (SettingHelper.Get("WarmUpAtStartup", false, SettingDomain))
++            OfficePreviewHostPool.RequestWarmUp(OfficeHandlerClsids());
++
++        // Housekeeping for previews of Protected View documents, which are served from a
++        // temporary copy. Done here rather than per preview so it can never sit on the
++        // critical path of the first preview.
++        ProtectedViewPreview.SweepStaleCopies();
++    }
++
++    /// <summary>
++    /// The preview handler CLSIDs actually registered for this machine's Office formats.
++    /// </summary>
++    private static IEnumerable<Guid> OfficeHandlerClsids()
++    {
++        return WarmUpExtensions
++            .Select(ShellExRegister.GetPreviewHandlerGUID)
++            .Where(guid => guid != Guid.Empty)
++            .Distinct();
+     }
+ 
+     public bool CanHandle(string path)
+@@ -106,56 +146,64 @@ public sealed class Plugin : IViewer
+ 
+     public void View(string path, ContextObject context)
+     {
+-        // MS Office interface does not allow loading of protected view (It's also possible that I haven't found a way)
+-        // Therefore, we need to predict in advance and then let users choose whether to lift the protection
+-        if (ZoneIdentifierManager.IsZoneBlocked(path))
++        // MS Office's preview handlers refuse to load a document that carries an Internet zone
++        // mark, so such a file is previewed through an unblocked temporary copy instead of
++        // having its own mark removed. Previewing used to rewrite the original document; now it
++        // is only ever read, and the user decides from the notice whether to unblock it for real.
++        var previewPath = path;
++        string temporaryCopy = null;
++
++        if (ProtectedViewPreview.IsProtected(path))
+         {
+-            context.Title = $"[PROTECTED VIEW] {Path.GetFileName(path)}";
+-            var alwaysUnblockProtectedView = SettingHelper.Get("AlwaysUnblockProtectedView", false, "QuickLook.Plugin.OfficeViewer");
++            temporaryCopy = ProtectedViewPreview.CreateUnblockedCopy(path);
+ 
+-            if (alwaysUnblockProtectedView)
+-            {
+-                _ = ZoneIdentifierManager.UnblockZone(path);
+-            }
+-            else
++            if (temporaryCopy == null)
+             {
+-                MessageBoxResult result = MessageBox.Show(
+-                    """
+-                    Be careful - files from the Internet can contain viruses.
+-                    The Office interface prevents loading in Protected View.
+-
+-                    Would you like OfficeViewer-Native to unblock the ZoneIdentifier of Internet?
+-                    """,
+-                    "PROTECTED VIEW",
+-                    MessageBoxButton.YesNo,
+-                    MessageBoxImage.Question
+-                );
+-
+-                if (result == MessageBoxResult.Yes)
+-                {
+-                    _ = ZoneIdentifierManager.UnblockZone(path);
+-                }
+-                else
++                // Copying failed (no temp access, disk full, ...). Say so, rather than handing
++                // the handler a file it is bound to refuse and showing a blank pane.
++                context.ViewerContent = new Label()
+                 {
+-                    context.ViewerContent = new Label()
+-                    {
+-                        Content = "The Office interface prevents loading in Protected View.",
+-                        VerticalAlignment = VerticalAlignment.Center,
+-                        HorizontalAlignment = HorizontalAlignment.Center,
+-                    };
+-                    context.Title = $"[PROTECTED VIEW] {Path.GetFileName(path)}";
+-                    context.IsBusy = false;
+-                    return;
+-                }
++                    Content = "该文档受 Office 保护，且无法创建用于预览的临时副本。",
++                    VerticalAlignment = VerticalAlignment.Center,
++                    HorizontalAlignment = HorizontalAlignment.Center,
++                };
++                context.Title = $"[PROTECTED VIEW] {Path.GetFileName(path)}";
++                context.IsBusy = false;
++                return;
+             }
++
++            previewPath = temporaryCopy;
+         }
+ 
+         try
+         {
++            _temporaryCopy = temporaryCopy;
+             _panel = new PreviewPanel();
+-            context.ViewerContent = _panel;
+-            context.Title = Path.GetFileName(path);
+-            _panel.PreviewFile(path, context);
++
++            if (temporaryCopy != null)
++            {
++                // The notice needs its own layout row above the preview: a WindowsFormsHost
++                // paints over any WPF sibling it overlaps, so it cannot be floated on top.
++                context.ViewerContent = new ProtectedViewBanner(path, _panel);
++                context.Title = $"[副本预览] {Path.GetFileName(path)}";
++            }
++            else
++            {
++                context.ViewerContent = _panel;
++                context.Title = Path.GetFileName(path);
++            }
++
++            var stopwatch = Stopwatch.StartNew();
++            var opened = _panel.PreviewFile(previewPath, context);
++            stopwatch.Stop();
++
++            ReportPreviewTiming(Path.GetExtension(path), stopwatch.ElapsedMilliseconds);
++
++            // The first Office preview is unavoidably cold: it starts the Office executable
++            // (measured 482-863 ms). Kick off the remaining handlers now so that browsing a
++            // folder of mixed documents never pays that cost a second time.
++            if (opened && SettingHelper.Get("WarmUpAfterFirstPreview", true, SettingDomain))
++                OfficePreviewHostPool.RequestWarmUp(OfficeHandlerClsids());
+         }
+         catch (Exception e)
+         {
+@@ -170,9 +218,31 @@ public sealed class Plugin : IViewer
+         context.IsBusy = false;
+     }
+ 
++    /// <summary>
++    /// Emits how long the synchronous part of a preview took.
++    ///
++    /// This is the bit that was missing before: Release builds had no timing data anywhere
++    /// in this pipeline, which is why "preview is slow" could not be attributed to the COM
++    /// activation step. Always goes to the debugger output; set <c>LogPreviewTiming</c> to
++    /// also append it to the exception log for post-hoc analysis.
++    /// </summary>
++    private static void ReportPreviewTiming(string extension, long elapsedMs)
++    {
++        var line = $"OfficeViewer: {extension} preview (handler activation + DoPreview) took {elapsedMs} ms";
++        Debug.WriteLine(line);
++
++        if (SettingHelper.Get("LogPreviewTiming", false, SettingDomain))
++            ProcessHelper.WriteLog(line);
++    }
++
+     public void Cleanup()
+     {
+         _panel?.Dispose();
+         _panel = null;
++
++        // Best effort: the copy is often still mapped by the warm Office host at this point, in
++        // which case the delete fails silently and the age based sweep in Init clears it later.
++        ProtectedViewPreview.TryDelete(_temporaryCopy);
++        _temporaryCopy = null;
+     }
+ }
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewHandlerHost.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewHandlerHost.cs
+index 1dac346..f4e86c0 100644
+--- a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewHandlerHost.cs
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewHandlerHost.cs
+@@ -16,7 +16,6 @@
+ // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ using System;
+-using System.Collections.Concurrent;
+ using System.ComponentModel;
+ using System.IO;
+ using System.Runtime.InteropServices;
+@@ -25,42 +24,24 @@ using System.Windows.Forms;
+ namespace QuickLook.Plugin.OfficeViewer;
+ 
+ /// <summary>
+-/// A Windows Forms host for Preview Handlers.
+-/// Supports out-of-process COM isolation (prevhost.exe via DllSurrogate) with automatic
+-/// in-process fallback, and tries initialization via IInitializeWithStream →
+-/// IInitializeWithItem → IInitializeWithFile in priority order — mirroring PowerToys Peek.
++/// A Windows Forms host for Shell preview handlers.
++///
++/// <para>Activation is delegated to <see cref="OfficePreviewHostPool"/>, which caches the
++/// out-of-process class factory and reclaims it when idle.</para>
++///
++/// <para><b>Note on the initialization order.</b> This used to always probe
++/// <c>IInitializeWithStream</c> → <c>IInitializeWithItem</c> → <c>IInitializeWithFile</c>.
++/// Forensics on a stock install show the three Office handlers implement <b>only</b>
++/// <c>IInitializeWithFile</c>, so the first two probes could never succeed: every preview
++/// paid for a <c>File.OpenRead</c> and a <c>SHCreateItemFromParsingName</c> that were
++/// guaranteed to be thrown away. The flavour that actually worked is now remembered per
++/// CLSID, so steady-state previews go straight to the one that matters — and non-Office
++/// handlers (e.g. the Visio surrogate) keep the original behaviour via the fallback order.</para>
+ /// </summary>
+ public class PreviewHandlerHost : Control
+ {
+-    // IID constants
+-    private static readonly Guid IidIClassFactory = new("00000001-0000-0000-C000-000000000046");
+-
+-    private static readonly Guid IidIUnknown = new("00000000-0000-0000-C000-000000000046");
+     private static readonly Guid IidIShellItem = new("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+ 
+-    // CLSCTX_LOCAL_SERVER — COM creates the server out-of-process (prevhost.exe when
+-    // a DllSurrogate is registered for the CLSID's AppID, which most Office/shell handlers have).
+-    private const uint ClsctxLocalServer = 0x4;
+-
+-    // Cache class factories so that the out-of-proc host (prevhost.exe) stays alive and
+-    // subsequent previews load faster — same technique used by PowerToys Peek.
+-    private static readonly ConcurrentDictionary<Guid, IClassFactory> HandlerFactories = new();
+-
+-    [DllImport("ole32.dll", ExactSpelling = true, PreserveSig = true)]
+-    private static extern int CoGetClassObject(
+-        ref Guid rclsid,
+-        uint dwClsContext,
+-        IntPtr pvReserved,
+-        ref Guid riid,
+-        [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+-
+-    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
+-    private static extern int SHCreateItemFromParsingName(
+-        [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+-        IntPtr pbc,
+-        ref Guid riid,
+-        [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+-
+     private IPreviewHandler _mCurrentPreviewHandler;
+     private Stream _fileStream;
+ 
+@@ -71,6 +52,13 @@ public class PreviewHandlerHost : Control
+     {
+     }
+ 
++    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
++    private static extern int SHCreateItemFromParsingName(
++        [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
++        IntPtr pbc,
++        ref Guid riid,
++        [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
++
+     /// <summary>
+     /// Gets the GUID of the current preview handler.
+     /// </summary>
+@@ -92,7 +80,11 @@ public class PreviewHandlerHost : Control
+         {
+             Marshal.FinalReleaseComObject(_mCurrentPreviewHandler);
+             _mCurrentPreviewHandler = null;
+-            GC.Collect();
++
++            // NOTE: a blocking GC.Collect() used to live here. This path runs on the WPF UI
++            // thread every time a preview window closes, so it stalled the UI for the
++            // duration of a full GC. Releasing the RCW is sufficient; the runtime reclaims
++            // the managed wrapper on its own schedule.
+         }
+ 
+         base.Dispose(disposing);
+@@ -122,7 +114,8 @@ public class PreviewHandlerHost : Control
+ 
+     /// <summary>
+     /// Opens the specified file using the appropriate preview handler and displays the result
+-    /// in this PreviewHandlerHost. Initialization priority: stream → item → file path.
++    /// in this PreviewHandlerHost. The initialization flavour that works for the handler is
++    /// tried first and remembered for subsequent previews.
+     /// </summary>
+     public bool Open(string path)
+     {
+@@ -139,57 +132,20 @@ public class PreviewHandlerHost : Control
+ 
+         CurrentPreviewHandler = guid;
+ 
+-        // 1. Try out-of-process COM first (prevhost.exe via DllSurrogate).
+-        //    If the handler is not registered for surrogate hosting, fall back to in-process.
+-        var o = TryCreateOutOfProcHandler(guid) ?? TryCreateInProcHandler(guid);
+-        if (o == null)
+-            return false;
++        // Out-of-process first: the Office handlers are registered as LocalServer32 against
++        // the Office executables, and the pool keeps that server warm between previews.
++        var o = OfficePreviewHostPool.CreateHandlerInstance(guid, out var localServerUnavailable);
+ 
+-        // 2. Initialize via the best-available interface: stream → item → file.
+-        const uint stgmRead = 0;
+-        bool initialized = false;
++        // In-process is kept purely as a fallback for CLSIDs with no LocalServer
++        // registration. It is dead code for Office itself — CLSCTX_INPROC_SERVER on the
++        // three Office handlers returns 0x80040154 (class not registered).
++        if (o == null && localServerUnavailable)
++            o = TryCreateInProcHandler(guid);
+ 
+-        if (!initialized && o is IInitializeWithStream streamInit)
+-        {
+-            try
+-            {
+-                _fileStream = File.OpenRead(path);
+-                streamInit.Initialize(new IStreamWrapper(_fileStream), stgmRead);
+-                initialized = true;
+-            }
+-            catch
+-            {
+-                _fileStream?.Dispose();
+-                _fileStream = null;
+-            }
+-        }
+-
+-        if (!initialized && o is IInitializeWithItem itemInit)
+-        {
+-            try
+-            {
+-                var riid = IidIShellItem;
+-                int hr = SHCreateItemFromParsingName(path, IntPtr.Zero, ref riid, out var shellItemObj);
+-                if (hr >= 0)
+-                {
+-                    itemInit.Initialize((IShellItem)shellItemObj, stgmRead);
+-                    initialized = true;
+-                }
+-            }
+-            catch { }
+-        }
+-
+-        if (!initialized && o is IInitializeWithFile fileInit)
+-        {
+-            try
+-            {
+-                fileInit.Initialize(path, stgmRead);
+-                initialized = true;
+-            }
+-            catch { }
+-        }
++        if (o == null)
++            return false;
+ 
+-        if (!initialized)
++        if (!TryInitializeHandler(guid, o, path))
+         {
+             Marshal.FinalReleaseComObject(o);
+             return false;
+@@ -228,50 +184,90 @@ public class PreviewHandlerHost : Control
+     }
+ 
+     /// <summary>
+-    /// Attempts to create the COM server out-of-process via a cached IClassFactory.
+-    /// Returns null if the CLSID has no out-of-process (surrogate) registration.
+-    /// Retries once if the host process appears to have died between calls.
++    /// Initializes <paramref name="handler"/>, trying the flavour remembered for this CLSID
++    /// first and only then falling back to the remaining ones. The flavour that succeeds is
++    /// cached so later previews skip the probes that cannot work.
+     /// </summary>
+-    private static object TryCreateOutOfProcHandler(Guid clsid)
++    private bool TryInitializeHandler(Guid clsid, object handler, string path)
+     {
+-        bool retry = false;
+-        do
++        var preferred = OfficePreviewHostPool.GetInitPreference(clsid);
++
++        var order = preferred switch
+         {
+-            if (!HandlerFactories.TryGetValue(clsid, out var factory))
+-            {
+-                var factoryIid = IidIClassFactory;
+-                int hr = CoGetClassObject(ref clsid, ClsctxLocalServer, IntPtr.Zero, ref factoryIid, out var factoryObj);
+-                if (hr < 0)
+-                    return null; // No local-server / surrogate registration — use in-proc.
+-
+-                factory = (IClassFactory)factoryObj;
+-                factory.LockServer(true);
+-                HandlerFactories.TryAdd(clsid, factory);
+-            }
++            InitKind.File => new[] { InitKind.File, InitKind.Item, InitKind.Stream },
++            InitKind.Item => new[] { InitKind.Item, InitKind.Stream, InitKind.File },
++            InitKind.Stream => new[] { InitKind.Stream, InitKind.Item, InitKind.File },
++            _ => new[] { InitKind.Stream, InitKind.Item, InitKind.File },
++        };
+ 
+-            try
++        foreach (var kind in order)
++        {
++            if (TryInitializeWith(kind, handler, path))
+             {
+-                var iid = IidIUnknown;
+-                factory.CreateInstance(null, ref iid, out var instance);
+-                return instance;
++                if (preferred != kind)
++                    OfficePreviewHostPool.SetInitPreference(clsid, kind);
++
++                return true;
+             }
+-            catch (COMException)
++        }
++
++        return false;
++    }
++
++    private bool TryInitializeWith(InitKind kind, object handler, string path)
++    {
++        const uint stgmRead = 0;
++
++        try
++        {
++            switch (kind)
+             {
+-                if (!retry)
+-                {
+-                    // Host process likely died; evict stale factory and retry once.
+-                    HandlerFactories.TryRemove(clsid, out _);
+-                    retry = true;
+-                }
+-                else
+-                {
+-                    break;
+-                }
++                case InitKind.Stream:
++                    if (handler is not IInitializeWithStream streamInit)
++                        return false;
++
++                    var stream = File.OpenRead(path);
++                    try
++                    {
++                        streamInit.Initialize(new IStreamWrapper(stream), stgmRead);
++                    }
++                    catch
++                    {
++                        stream.Dispose();
++                        throw;
++                    }
++
++                    _fileStream = stream;
++                    return true;
++
++                case InitKind.Item:
++                    if (handler is not IInitializeWithItem itemInit)
++                        return false;
++
++                    var riid = IidIShellItem;
++                    var hr = SHCreateItemFromParsingName(path, IntPtr.Zero, ref riid, out var shellItemObj);
++                    if (hr < 0)
++                        return false;
++
++                    itemInit.Initialize((IShellItem)shellItemObj, stgmRead);
++                    return true;
++
++                case InitKind.File:
++                    if (handler is not IInitializeWithFile fileInit)
++                        return false;
++
++                    fileInit.Initialize(path, stgmRead);
++                    return true;
++
++                default:
++                    return false;
+             }
+         }
+-        while (retry);
+-
+-        return null;
++        catch (Exception)
++        {
++            // Probe failed — the caller moves on to the next flavour.
++            return false;
++        }
+     }
+ 
+     /// <summary>
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewPanel.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewPanel.cs
+index c2b4d7d..dab9979 100644
+--- a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewPanel.cs
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/PreviewPanel.cs
+@@ -39,11 +39,11 @@ public class PreviewPanel : WindowsFormsHost, IDisposable
+         });
+     }
+ 
+-    public void PreviewFile(string file, ContextObject context)
++    public bool PreviewFile(string file, ContextObject context)
+     {
+         _control = new PreviewHandlerHost();
+         Child = _control;
+-        _control.Open(file);
++        return _control.Open(file);
+     }
+ 
+     [DllImport("user32.dll")]
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
+new file mode 100644
+index 0000000..0daedc8
+--- /dev/null
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
+@@ -0,0 +1,182 @@
++// Copyright © 2017-2026 QL-Win Contributors
++//
++// This file is part of QuickLook program.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++using System;
++using System.Windows;
++using System.Windows.Controls;
++using System.Windows.Input;
++using System.Windows.Media;
++
++namespace QuickLook.Plugin.OfficeViewer;
++
++/// <summary>
++/// The slim notice strip placed above a preview that was rendered from a temporary copy of a
++/// Protected View document (see <see cref="ProtectedViewPreview"/>).
++///
++/// <para>It does two things the old confirmation dialog could not: it states up front that what
++/// is on screen is a copy and that the original file was left alone, and it offers an explicit,
++/// user-triggered way to remove the Protected View mark from the original — so the decision to
++/// modify a file is always made knowingly, and never as a side effect of looking at it.</para>
++///
++/// <para>The strip is deliberately built from plain shapes with hard-coded colours instead of
++/// theme resources. A <c>WindowsFormsHost</c> always paints over its WPF siblings, so the notice
++/// has to live in its own layout row rather than float above the preview — and because it sits
++/// in the layout, its appearance must not depend on whether QuickLook is running light or dark.</para>
++/// </summary>
++internal sealed class ProtectedViewBanner : Grid
++{
++    private static readonly Brush StripBackground = Freeze(Color.FromRgb(0xFF, 0xF4, 0xCE));
++    private static readonly Brush StripBorder = Freeze(Color.FromRgb(0xE3, 0xC0, 0x6A));
++    private static readonly Brush PrimaryText = Freeze(Color.FromRgb(0x5C, 0x44, 0x00));
++    private static readonly Brush ButtonFace = Freeze(Colors.White);
++    private static readonly Brush ButtonFaceHover = Freeze(Color.FromRgb(0xFF, 0xE6, 0x9C));
++    private static readonly Brush ButtonEdge = Freeze(Color.FromRgb(0xC9, 0xA2, 0x27));
++
++    private static readonly Brush SuccessBackground = Freeze(Color.FromRgb(0xE7, 0xF6, 0xE9));
++    private static readonly Brush SuccessBorder = Freeze(Color.FromRgb(0xA8, 0xD5, 0xAE));
++    private static readonly Brush SuccessText = Freeze(Color.FromRgb(0x1E, 0x5B, 0x2B));
++
++    private static readonly Brush FailureBackground = Freeze(Color.FromRgb(0xFD, 0xE7, 0xE9));
++    private static readonly Brush FailureBorder = Freeze(Color.FromRgb(0xE7, 0xA9, 0xAF));
++    private static readonly Brush FailureText = Freeze(Color.FromRgb(0x8E, 0x1F, 0x28));
++
++    private readonly string _sourcePath;
++    private readonly Border _strip;
++    private readonly TextBlock _message;
++    private readonly ContentControl _actionHost;
++
++    public ProtectedViewBanner(string sourcePath, UIElement content)
++    {
++        _sourcePath = sourcePath;
++
++        RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
++        RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
++
++        _message = new TextBlock
++        {
++            TextWrapping = TextWrapping.Wrap,
++            VerticalAlignment = VerticalAlignment.Center,
++            Foreground = PrimaryText,
++            FontSize = 13,
++            FontWeight = FontWeights.SemiBold,
++            Text = "副本预览 — 该文件来自 Internet，Office 无法在“受保护的视图”下加载，"
++                 + "所以这里显示的是临时副本，内容与原文件一致。你的原文件没有被修改。",
++        };
++
++        _actionHost = new ContentControl { VerticalAlignment = VerticalAlignment.Center };
++        _actionHost.Content = BuildActionButton("解除源文件保护视图", UnblockSource);
++
++        var dock = new DockPanel { LastChildFill = true };
++        DockPanel.SetDock(_actionHost, Dock.Right);
++        dock.Children.Add(_actionHost);
++        dock.Children.Add(_message);
++
++        _strip = new Border
++        {
++            Background = StripBackground,
++            BorderBrush = StripBorder,
++            BorderThickness = new Thickness(0, 0, 0, 1),
++            Padding = new Thickness(12, 7, 12, 7),
++            Child = dock,
++        };
++
++        Grid.SetRow(_strip, 0);
++        Children.Add(_strip);
++
++        Grid.SetRow(content, 1);
++        Children.Add(content);
++    }
++
++    /// <summary>
++    /// Removes the Protected View mark from the original file. Runs on the UI thread and only
++    /// in response to a click, so the user is always the one deciding to change the file.
++    /// </summary>
++    private void UnblockSource()
++    {
++        var unblocked = ProtectedViewPreview.UnblockSource(_sourcePath);
++
++        if (unblocked)
++        {
++            _strip.Background = SuccessBackground;
++            _strip.BorderBrush = SuccessBorder;
++            _message.Foreground = SuccessText;
++            _message.Text = "已解除源文件的保护视图标记 — 以后打开它不会再进入受保护的视图。"
++                          + "文档内容本身没有做任何改动。";
++            _actionHost.Content = BuildDoneTag();
++        }
++        else
++        {
++            _strip.Background = FailureBackground;
++            _strip.BorderBrush = FailureBorder;
++            _message.Foreground = FailureText;
++            _message.Text = "解除失败：文件可能被占用或权限不足。"
++                          + "也可以右键该文件 → 属性 → 勾选“解除锁定”。";
++            _actionHost.Content = BuildActionButton("重试", UnblockSource);
++        }
++    }
++
++    private static Border BuildActionButton(string caption, Action onClick)
++    {
++        var label = new TextBlock
++        {
++            Text = caption,
++            FontSize = 13,
++            FontWeight = FontWeights.SemiBold,
++            Foreground = PrimaryText,
++            VerticalAlignment = VerticalAlignment.Center,
++        };
++
++        var button = new Border
++        {
++            Child = label,
++            Background = ButtonFace,
++            BorderBrush = ButtonEdge,
++            BorderThickness = new Thickness(1),
++            CornerRadius = new CornerRadius(4),
++            Padding = new Thickness(12, 4, 12, 4),
++            Margin = new Thickness(14, 0, 0, 0),
++            Cursor = Cursors.Hand,
++            ToolTip = "删除该文件上的 Zone.Identifier 标记，等同于在文件属性里点“解除锁定”。只影响这一个文件。",
++        };
++
++        button.MouseEnter += (_, __) => button.Background = ButtonFaceHover;
++        button.MouseLeave += (_, __) => button.Background = ButtonFace;
++        button.MouseLeftButtonUp += (_, __) => onClick();
++
++        return button;
++    }
++
++    private static TextBlock BuildDoneTag()
++    {
++        return new TextBlock
++        {
++            Text = "✓ 已解除",
++            FontSize = 13,
++            FontWeight = FontWeights.SemiBold,
++            Foreground = SuccessText,
++            Margin = new Thickness(14, 0, 0, 0),
++            VerticalAlignment = VerticalAlignment.Center,
++        };
++    }
++
++    private static Brush Freeze(Color color)
++    {
++        var brush = new SolidColorBrush(color);
++        brush.Freeze();
++        return brush;
++    }
++}
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewPreview.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewPreview.cs
+new file mode 100644
+index 0000000..ffde8a1
+--- /dev/null
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewPreview.cs
+@@ -0,0 +1,253 @@
++// Copyright © 2017-2026 QL-Win Contributors
++//
++// This file is part of QuickLook program.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++using System;
++using System.IO;
++using System.Runtime.InteropServices;
++using System.Security.Cryptography;
++using System.Text;
++using UnblockZoneIdentifier;
++
++namespace QuickLook.Plugin.OfficeViewer;
++
++/// <summary>
++/// Preview support for documents carrying a <c>Zone.Identifier</c> mark ("downloaded from the
++/// Internet"), which Windows surfaces as Protected View.
++///
++/// <para>The Office preview handlers refuse to load a marked file, so the mark has to go
++/// before the document can be rendered at all. QuickLook used to remove that mark from the
++/// <b>original</b> file — i.e. previewing a document silently rewrote it, and afterwards Word
++/// would no longer open it in Protected View either. That is surprising for what is supposed
++/// to be a read-only peek. Instead a temporary copy is streamed into
++/// <c>%TEMP%\QuickLook\OfficeViewer</c> and only that copy is unblocked: the original is
++/// opened for reading and never modified.</para>
++///
++/// <para>The copy is written byte-by-byte into a brand-new file, so it cannot inherit the
++/// source's alternate data stream in the first place. The unblocking below is therefore a
++/// verification step, not the mechanism that makes the preview work.</para>
++/// </summary>
++internal static class ProtectedViewPreview
++{
++    /// <summary>Copies in the cache are deleted once they are older than this.</summary>
++    public static readonly TimeSpan CopyRetention = TimeSpan.FromDays(1);
++
++    private static readonly string CacheDirectory =
++        Path.Combine(Path.GetTempPath(), "QuickLook", "OfficeViewer");
++
++    /// <summary>Name of the NTFS alternate data stream holding the zone mark.</summary>
++    private const string ZoneStream = ":Zone.Identifier";
++
++    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
++    [return: MarshalAs(UnmanagedType.Bool)]
++    private static extern bool DeleteFileW(string lpFileName);
++
++    /// <summary>
++    /// True when the file carries an Internet zone mark and would open in Protected View.
++    /// </summary>
++    public static bool IsProtected(string path) => IsBlocked(path);
++
++    /// <summary>
++    /// Produces an unblocked copy of <paramref name="sourcePath"/> and returns its path, or
++    /// <c>null</c> when the copy could not be created. The source is opened read-only with
++    /// maximally permissive sharing so that previewing never disturbs whoever else has it open.
++    /// </summary>
++    public static string CreateUnblockedCopy(string sourcePath)
++    {
++        try
++        {
++            Directory.CreateDirectory(CacheDirectory);
++
++            var target = Path.Combine(CacheDirectory, BuildCopyName(sourcePath));
++
++            try
++            {
++                WriteCopy(sourcePath, target);
++            }
++            catch (IOException)
++            {
++                // A warm Office host may still hold the previous copy of this very file open.
++                // Fall back to a unique name rather than failing the preview.
++                target = Path.Combine(CacheDirectory, BuildCopyName(sourcePath, unique: true));
++                WriteCopy(sourcePath, target);
++            }
++
++            // The copy is clean by construction; confirm it, because a copy that is *still*
++            // blocked would present to the user as exactly the bug this code exists to avoid.
++            if (IsBlocked(target))
++                RemoveMark(target);
++
++            return target;
++        }
++        catch
++        {
++            return null;
++        }
++    }
++
++    /// <summary>
++    /// Removes the Internet zone mark from <paramref name="path"/> in place. Only ever called
++    /// on an explicit user request (the banner button), never automatically.
++    /// </summary>
++    public static bool UnblockSource(string path)
++    {
++        try
++        {
++            if (!IsBlocked(path))
++                return true;
++
++            RemoveMark(path);
++            return !IsBlocked(path);
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    /// <summary>Best-effort removal of a copy that is no longer needed.</summary>
++    public static void TryDelete(string path)
++    {
++        if (string.IsNullOrEmpty(path))
++            return;
++
++        try
++        {
++            File.Delete(path);
++        }
++        catch
++        {
++            // Still mapped by an Office host; the age based sweep picks it up later.
++        }
++    }
++
++    /// <summary>
++    /// Deletes cached copies left behind by earlier sessions. Called once, when the plugin is
++    /// loaded, so it never sits on the path of a preview.
++    /// </summary>
++    public static void SweepStaleCopies()
++    {
++        try
++        {
++            if (!Directory.Exists(CacheDirectory))
++                return;
++
++            var cutoff = DateTime.UtcNow - CopyRetention;
++
++            foreach (var file in Directory.GetFiles(CacheDirectory))
++            {
++                try
++                {
++                    if (File.GetLastWriteTimeUtc(file) < cutoff)
++                        File.Delete(file);
++                }
++                catch
++                {
++                    // In use by a warm Office host; it will be swept on a later run.
++                }
++            }
++        }
++        catch
++        {
++            // Housekeeping must never break startup.
++        }
++    }
++
++    private static void WriteCopy(string source, string target)
++    {
++        using var input = new FileStream(
++            source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
++        using var output = new FileStream(
++            target, FileMode.Create, FileAccess.Write, FileShare.Read);
++
++        input.CopyTo(output, 81920);
++    }
++
++    /// <summary>
++    /// Deterministic file name for the copy, derived from the source path plus its size and
++    /// timestamp so that editing the document produces a new name instead of a stale hit.
++    /// </summary>
++    private static string BuildCopyName(string sourcePath, bool unique = false)
++    {
++        var info = new FileInfo(sourcePath);
++        var stamp = string.Concat(
++            sourcePath, "|",
++            info.Length.ToString(), "|",
++            info.LastWriteTimeUtc.Ticks.ToString());
++
++        string tag;
++        using (var sha = SHA256.Create())
++        {
++            var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(stamp));
++            var hex = new StringBuilder(12);
++            for (var i = 0; i < 6; i++)
++                hex.Append(hash[i].ToString("x2"));
++            tag = hex.ToString();
++        }
++
++        if (unique)
++            tag += "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
++
++        var name = Path.GetFileNameWithoutExtension(sourcePath);
++        foreach (var invalid in Path.GetInvalidFileNameChars())
++            name = name.Replace(invalid, '_');
++        if (name.Length > 60)
++            name = name.Substring(0, 60);
++
++        return string.Concat(name, "-", tag, Path.GetExtension(sourcePath));
++    }
++
++    private static bool IsBlocked(string path)
++    {
++        try
++        {
++            return ZoneIdentifierManager.IsZoneBlocked(path);
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    /// <summary>
++    /// Clears the zone mark. The packaged API is tried first so the behaviour stays consistent
++    /// with how QuickLook detects the mark; deleting the alternate data stream directly is the
++    /// deterministic fallback (it is exactly what "Unblock" in the file properties does).
++    /// </summary>
++    private static void RemoveMark(string path)
++    {
++        try
++        {
++            ZoneIdentifierManager.RemoveZone(path);
++        }
++        catch
++        {
++            // Fall through to the direct implementation.
++        }
++
++        if (!IsBlocked(path))
++            return;
++
++        try
++        {
++            DeleteFileW(path + ZoneStream);
++        }
++        catch
++        {
++            // Reported to the caller via the verification in UnblockSource.
++        }
++    }
++}
+-- 
+2.55.0.windows.3
+
+
+From bbd470c12c3a347733abd9fa9dd62491f67b8700 Mon Sep 17 00:00:00 2001
+From: Fei Yunbin <realshadow4869@gmail.com>
+Date: Sat, 12 Sep 2026 14:54:49 +0800
+Subject: [PATCH 2/2] OfficeViewer: bilingual (zh/en) UI text for the Protected
+ View notice
+
+The notice strip, its button and the viewer title prefix were Chinese-only.
+They now live in one place, UiText.cs, with a Chinese and an English variant.
+
+The language follows the Windows UI language (CultureInfo.CurrentUICulture),
+so nothing has to be configured; a new 'UiLanguage' setting (auto/zh/en) can
+force one. Everything else QuickLook draws is untouched.
+
+No behaviour change: same copy-preview path, same banner geometry, same
+button semantics - only the strings moved.
+---
+ .../QuickLook.Plugin.OfficeViewer/Plugin.cs   |   6 +-
+ .../ProtectedViewBanner.cs                    |  17 +-
+ .../QuickLook.Plugin.OfficeViewer/UiText.cs   | 150 ++++++++++++++++++
+ 3 files changed, 160 insertions(+), 13 deletions(-)
+ create mode 100644 QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/UiText.cs
+
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
+index ca341f9..f47efdf 100644
+--- a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/Plugin.cs
+@@ -163,11 +163,11 @@ public sealed class Plugin : IViewer
+                 // the handler a file it is bound to refuse and showing a blank pane.
+                 context.ViewerContent = new Label()
+                 {
+-                    Content = "该文档受 Office 保护，且无法创建用于预览的临时副本。",
++                    Content = UiText.NoCopyAvailable,
+                     VerticalAlignment = VerticalAlignment.Center,
+                     HorizontalAlignment = HorizontalAlignment.Center,
+                 };
+-                context.Title = $"[PROTECTED VIEW] {Path.GetFileName(path)}";
++                context.Title = UiText.TitleProtectedView(Path.GetFileName(path));
+                 context.IsBusy = false;
+                 return;
+             }
+@@ -185,7 +185,7 @@ public sealed class Plugin : IViewer
+                 // The notice needs its own layout row above the preview: a WindowsFormsHost
+                 // paints over any WPF sibling it overlaps, so it cannot be floated on top.
+                 context.ViewerContent = new ProtectedViewBanner(path, _panel);
+-                context.Title = $"[副本预览] {Path.GetFileName(path)}";
++                context.Title = UiText.TitleCopyPreview(Path.GetFileName(path));
+             }
+             else
+             {
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
+index 0daedc8..86d0425 100644
+--- a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/ProtectedViewBanner.cs
+@@ -73,12 +73,11 @@ internal sealed class ProtectedViewBanner : Grid
+             Foreground = PrimaryText,
+             FontSize = 13,
+             FontWeight = FontWeights.SemiBold,
+-            Text = "副本预览 — 该文件来自 Internet，Office 无法在“受保护的视图”下加载，"
+-                 + "所以这里显示的是临时副本，内容与原文件一致。你的原文件没有被修改。",
++            Text = UiText.BannerMessage,
+         };
+ 
+         _actionHost = new ContentControl { VerticalAlignment = VerticalAlignment.Center };
+-        _actionHost.Content = BuildActionButton("解除源文件保护视图", UnblockSource);
++        _actionHost.Content = BuildActionButton(UiText.BannerActionLabel, UnblockSource);
+ 
+         var dock = new DockPanel { LastChildFill = true };
+         DockPanel.SetDock(_actionHost, Dock.Right);
+@@ -114,8 +113,7 @@ internal sealed class ProtectedViewBanner : Grid
+             _strip.Background = SuccessBackground;
+             _strip.BorderBrush = SuccessBorder;
+             _message.Foreground = SuccessText;
+-            _message.Text = "已解除源文件的保护视图标记 — 以后打开它不会再进入受保护的视图。"
+-                          + "文档内容本身没有做任何改动。";
++            _message.Text = UiText.BannerDoneMessage;
+             _actionHost.Content = BuildDoneTag();
+         }
+         else
+@@ -123,9 +121,8 @@ internal sealed class ProtectedViewBanner : Grid
+             _strip.Background = FailureBackground;
+             _strip.BorderBrush = FailureBorder;
+             _message.Foreground = FailureText;
+-            _message.Text = "解除失败：文件可能被占用或权限不足。"
+-                          + "也可以右键该文件 → 属性 → 勾选“解除锁定”。";
+-            _actionHost.Content = BuildActionButton("重试", UnblockSource);
++            _message.Text = UiText.BannerFailureMessage;
++            _actionHost.Content = BuildActionButton(UiText.BannerRetryLabel, UnblockSource);
+         }
+     }
+ 
+@@ -150,7 +147,7 @@ internal sealed class ProtectedViewBanner : Grid
+             Padding = new Thickness(12, 4, 12, 4),
+             Margin = new Thickness(14, 0, 0, 0),
+             Cursor = Cursors.Hand,
+-            ToolTip = "删除该文件上的 Zone.Identifier 标记，等同于在文件属性里点“解除锁定”。只影响这一个文件。",
++            ToolTip = UiText.BannerActionTip,
+         };
+ 
+         button.MouseEnter += (_, __) => button.Background = ButtonFaceHover;
+@@ -164,7 +161,7 @@ internal sealed class ProtectedViewBanner : Grid
+     {
+         return new TextBlock
+         {
+-            Text = "✓ 已解除",
++            Text = UiText.BannerDoneTag,
+             FontSize = 13,
+             FontWeight = FontWeights.SemiBold,
+             Foreground = SuccessText,
+diff --git a/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/UiText.cs b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/UiText.cs
+new file mode 100644
+index 0000000..c5396ef
+--- /dev/null
++++ b/QuickLook.Plugin/QuickLook.Plugin.OfficeViewer/UiText.cs
+@@ -0,0 +1,150 @@
++// Copyright © 2017-2026 QL-Win Contributors
++//
++// This file is part of QuickLook program.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++using System;
++using System.Globalization;
++using QuickLook.Common.Helpers;
++
++namespace QuickLook.Plugin.OfficeViewer;
++
++/// <summary>
++/// Bilingual (Chinese / English) text for everything this patch draws itself.
++///
++/// <para>Everything QuickLook already drew — the window frame, the other plugins — is untouched;
++/// only the strings added by this patch live here.</para>
++///
++/// <para>The language is taken from the Windows UI language of the current user
++/// (<see cref="CultureInfo.CurrentUICulture"/>), so a Chinese Windows gets Chinese and every other
++/// system gets English with no configuration. It can be forced with the <c>UiLanguage</c> setting
++/// (<c>auto</c> / <c>zh</c> / <c>en</c>) — see the README.</para>
++/// </summary>
++internal static class UiText
++{
++    private const string SettingDomain = "QuickLook.Plugin.OfficeViewer";
++
++    private static bool? _chinese;
++
++    private static bool Chinese
++    {
++        get
++        {
++            if (_chinese == null)
++            {
++                _chinese = Resolve();
++            }
++
++            return _chinese.Value;
++        }
++    }
++
++    private static bool Resolve()
++    {
++        // Explicit setting wins.
++        try
++        {
++            var preference = SettingHelper.Get("UiLanguage", "auto", SettingDomain);
++            if (!string.IsNullOrWhiteSpace(preference))
++            {
++                switch (preference.Trim().ToLowerInvariant())
++                {
++                    case "zh":
++                    case "cn":
++                    case "chs":
++                    case "zh-cn":
++                    case "zh-hans":
++                        return true;
++                    case "en":
++                    case "eng":
++                    case "en-us":
++                        return false;
++                }
++            }
++        }
++        catch
++        {
++            // A missing or unreadable config file must never break a preview.
++        }
++
++        // Otherwise follow the Windows UI language.
++        try
++        {
++            return CultureInfo.CurrentUICulture.TwoLetterISOLanguageName
++                .Equals("zh", StringComparison.OrdinalIgnoreCase);
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    /// <summary>Picks one of two strings by the resolved UI language.</summary>
++    public static string T(string chinese, string english)
++    {
++        return Chinese ? chinese : english;
++    }
++
++    // ---- Protected View notice strip ---------------------------------------
++
++    public static string BannerMessage => T(
++        "副本预览 — 该文件来自 Internet，Office 无法在“受保护的视图”下加载，"
++        + "所以这里显示的是临时副本，内容与原文件一致。你的原文件没有被修改。",
++        "Copy preview — this file came from the Internet, so Office refuses to load it "
++        + "in Protected View. What you see is a temporary copy of it. Your original file "
++        + "has not been modified.");
++
++    public static string BannerActionLabel => T(
++        "解除源文件保护视图",
++        "Unblock the original file");
++
++    public static string BannerActionTip => T(
++        "删除该文件上的 Zone.Identifier 标记，等同于在文件属性里点“解除锁定”。只影响这一个文件。",
++        "Removes the Zone.Identifier mark from that one file — the same as ticking "
++        + "\"Unblock\" in its file properties. Affects only that file.");
++
++    public static string BannerDoneMessage => T(
++        "已解除源文件的保护视图标记 — 以后打开它不会再进入受保护的视图。"
++        + "文档内容本身没有做任何改动。",
++        "Protected View mark removed from the original file — it will now open normally. "
++        + "The document content itself was not touched.");
++
++    public static string BannerDoneTag => T("✓ 已解除", "✓ Unblocked");
++
++    public static string BannerFailureMessage => T(
++        "解除失败：文件可能被占用或权限不足。"
++        + "也可以右键该文件 → 属性 → 勾选“解除锁定”。",
++        "Could not unblock: the file may be in use or you may lack permission. You can "
++        + "also right-click the file → Properties → tick \"Unblock\".");
++
++    public static string BannerRetryLabel => T("重试", "Retry");
++
++    // ---- Viewer title -------------------------------------------------------
++
++    public static string TitleCopyPreview(string fileName)
++    {
++        return T($"[副本预览] {fileName}", $"[Copy preview] {fileName}");
++    }
++
++    public static string TitleProtectedView(string fileName)
++    {
++        return $"[PROTECTED VIEW] {fileName}";
++    }
++
++    public static string NoCopyAvailable => T(
++        "该文档受 Office 保护，且无法创建用于预览的临时副本。",
++        "This document is protected by Office and no temporary copy could be created "
++        + "for previewing it.");
++}
+-- 
+2.55.0.windows.3

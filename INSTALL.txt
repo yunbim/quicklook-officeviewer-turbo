@@ -1,0 +1,115 @@
+QuickLook Office 极速预览版 (Turbo)
+Turbo previews for QuickLook's Office plugin
+==================================================
+安装说明 / HOW TO INSTALL
+  中文在下半部分 / English is in the lower half.
+==================================================
+
+你拿到的是「只含插件」的精简包，里面只有一个真正需要部署的文件。
+This is the plugin-only package: exactly one file actually gets deployed.
+
+
+--------------------------------------------------
+中文
+--------------------------------------------------
+三步装好：
+
+  1. 解压本压缩包到一个文件夹（不要只把单个文件拖出来，
+     install.bat 需要用到同目录的 plugin\ 子文件夹）。
+
+  2. 双击 install.bat
+
+     它会自动：定位你的 QuickLook 安装目录 -> 关闭正在运行的 QuickLook
+     -> 备份你当前的插件 DLL -> 换成极速版 DLL -> 逐字节校验 -> 重新启动。
+     不需要安装任何额外软件（用的是 Windows 自带的 PowerShell）。
+     装在 Program Files 下才需要管理员权限。
+
+     找不到 QuickLook 时它会提示你粘贴路径；也可以用参数直接指定：
+         install.bat "D:\Apps\QuickLook"
+
+  3. 完事。对着 Word / Excel / PowerPoint 文件按空格即可。
+
+还原官方原版：双击 rollback.bat。
+
+它做了什么：
+  * 只替换一个文件
+      QuickLook.Plugin\QuickLook.Plugin.OfficeViewer\QuickLook.Plugin.OfficeViewer.dll
+    主程序 QuickLook.exe 与其他 24 个插件保持官方原样，可与官方版混用。
+
+  * 连续预览 Office 文件从「每次卡半秒」变成「秒开」。
+    根因：Office 的预览处理器 LocalServer32 直接指向 Office 主程序本身，
+    所以原版每预览一个文件就等于启动一次 Office（实测 482~863 ms）。
+    极速版把处理器工厂保活，第 2 次起是约 2 ms 的热激活；并加空闲回收，
+    不会像原版那样把 Office 进程永久钉在内存里（约 355 MB）。
+
+  * 下载来的文件（带 Zone.Identifier）不再弹 Protected View 确认框，
+    改为渲染一份临时副本 —— 你的原文件一个字节都不会被改动。
+    预览页顶部有提示条，按不按「解除源文件保护视图」由你决定。
+    普通文档完全走原路径，体验和官方版一模一样。
+
+  * 提示条文案有中英文两版，默认跟随 Windows 界面语言。
+
+完整说明、源码、实现细节、验证方法：
+    https://github.com/yunbim/quicklook-officeviewer-turbo
+
+
+--------------------------------------------------
+English
+--------------------------------------------------
+Three steps:
+
+  1. Unzip this archive into a folder. Do not just drag out the single DLL -
+     install.bat needs the plugin\ folder sitting next to it.
+
+  2. Double-click install.bat
+
+     It automatically locates your QuickLook installation, stops it, backs up
+     the current plugin DLL, replaces it with the Turbo DLL, verifies the
+     result byte-for-byte, and restarts QuickLook. Nothing extra to install -
+     it uses the PowerShell that ships with Windows; no Python.
+     Administrator rights are only needed if QuickLook lives under
+     "Program Files".
+
+     If QuickLook is somewhere unusual the script asks you for the path. You
+     can also pass it directly:
+         install.bat "D:\Apps\QuickLook"
+
+  3. Done. Press Space on any Word / Excel / PowerPoint file.
+
+To go back to the stock plugin: double-click rollback.bat.
+
+What it does:
+  * Replaces exactly one file
+      QuickLook.Plugin\QuickLook.Plugin.OfficeViewer\QuickLook.Plugin.OfficeViewer.dll
+    QuickLook.exe and the other 24 plugins stay exactly as upstream ships them,
+    so it mixes freely with a stock installation.
+
+  * Consecutive Office previews go from "half a second of stall every time" to
+    instant. Root cause: the Office preview handler's LocalServer32 points
+    straight at the Office executable, so every stock preview starts an Office
+    process (measured 482-863 ms). Turbo keeps the handler's class factory
+    alive, so the 2nd and later activations cost ~2 ms; an idle watchdog then
+    releases the processes instead of pinning them in memory (~355 MB).
+
+  * Internet-downloaded files (carrying a Zone.Identifier) no longer raise the
+    Protected View confirmation dialog. They are rendered from a temporary
+    copy, so your original file is never modified. A notice strip explains this
+    and offers an explicit "Unblock the original file" button. Ordinary
+    documents take the untouched stock path.
+
+  * The notice strip has both a Chinese and an English version and follows the
+    Windows UI language by default.
+
+Full documentation, source code, implementation notes and verification methods:
+    https://github.com/yunbim/quicklook-officeviewer-turbo
+
+
+--------------------------------------------------
+出处与许可 / Origin and licence
+--------------------------------------------------
+基于 QL-Win/QuickLook（GPL-3.0）4.5.0 的非官方插件级补丁。
+Unofficial plugin-level patch for QL-Win/QuickLook 4.5.0 (GPL-3.0).
+
+上游项目 / Upstream : https://github.com/QL-Win/QuickLook
+本补丁同样以 GPL-3.0 发布。上游与本补丁无隶属关系，也未背书。
+Released under GPL-3.0 as well. Not affiliated with, nor endorsed by, upstream.
